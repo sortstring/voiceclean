@@ -1,0 +1,28 @@
+Metadata-Version: 2.4
+Name: voiceclean
+Version: 0.1.0
+Summary: Real-time AEC, noise suppression, and VAD for voice agents — wraps SpeexDSP, RNNoise, and Silero VAD.
+Author: SortString Solutions
+License-Expression: MIT
+Project-URL: Homepage, https://github.com/sortstring/voiceclean
+Keywords: aec,echo-cancellation,noise-suppression,vad,voice-agent,telephony
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Developers
+Classifier: Programming Language :: Python :: 3
+Classifier: Topic :: Multimedia :: Sound/Audio :: Speech
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy
+Requires-Dist: soxr
+Provides-Extra: speexdsp
+Requires-Dist: speexdsp>=0.1; extra == "speexdsp"
+Provides-Extra: rnnoise
+Requires-Dist: pyrnnoise>=0.4; extra == "rnnoise"
+Provides-Extra: silero
+Requires-Dist: onnxruntime>=1.16; extra == "silero"
+Provides-Extra: pipecat
+Requires-Dist: pipecat-ai>=1.0; extra == "pipecat"
+Provides-Extra: all
+Requires-Dist: voiceclean[pipecat,rnnoise,silero,speexdsp]; extra == "all"
+Dynamic: license-file
