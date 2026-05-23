@@ -30,8 +30,10 @@ class VoiceCleanVAD(VADAnalyzer):
         self._vc = vc
 
     def num_frames_required(self) -> int:
-        # 10 ms windows to match AIC VAD's cadence
-        return int(self.sample_rate * 0.01) if self.sample_rate > 0 else 160
+        # Silero VAD needs 256 samples at 8kHz (32ms) or 512 at 16kHz
+        if self.sample_rate >= 16000:
+            return 512
+        return 256
 
     def voice_confidence(self, buffer: bytes) -> float:
         if not self._vc.has_vad:

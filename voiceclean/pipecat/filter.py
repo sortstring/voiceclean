@@ -74,7 +74,7 @@ class VoiceCleanFilter(BaseAudioFilter):
     def __init__(
         self,
         sample_rate: int = 8000,
-        aec_filter_length: int = 1600,
+        aec_filter_length: int = 4000,
         aec_frame_size: int = 160,
         vad_threshold: float = 0.5,
     ) -> None:
@@ -120,5 +120,13 @@ class VoiceCleanFilter(BaseAudioFilter):
         if self._bypass or len(audio) == 0:
             return audio
 
-        result = self._vc.process(audio)
-        return result.audio
+        # Run AEC + denoise only — VAD is driven separately by the
+        # VADAnalyzer to avoid double-processing Silero's stateful LSTM.
+        cleaned = audio
+        if self._vc._aec is not None:
+            cleaned = self._vc._aec.process(cleaned)
+        if self._vc._denoiser is not None:
+            denoised = self._vc._denoiser.process(cleaned)
+            if denoised:
+                cleaned = denoised
+        return cleaned
