@@ -89,6 +89,8 @@ class AEC:
         self._lock = threading.Lock()
         self._play_buf = bytearray()
         self._mic_buf = bytearray()
+        self._play_frames = 0
+        self._capture_frames = 0
 
     def __del__(self):
         if hasattr(self, "_state") and self._state:
@@ -109,6 +111,7 @@ class AEC:
 
                 play_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(frame)
                 self._lib.speex_echo_playback(self._state, play_arr)
+                self._play_frames += 1
 
     def process(self, mic_audio: bytes) -> bytes:
         """Remove echo from mic audio.
@@ -128,6 +131,7 @@ class AEC:
 
                 self._lib.speex_echo_capture(self._state, mic_arr, out_arr)
                 out_chunks.append(bytes(out_arr))
+                self._capture_frames += 1
 
         if not out_chunks:
             return b""
