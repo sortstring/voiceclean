@@ -1,14 +1,15 @@
 """Acoustic Echo Cancellation via libspeexdsp (ctypes).
 
-Wraps libspeexdsp's echo canceller directly via ctypes — the pip
-'speexdsp' package is broken on Python 3.12+ (uses removed 'imp' module).
+Uses SpeexDSP's asynchronous playback/capture API which handles the
+delay alignment between outgoing (bot) audio and incoming (mic) audio
+internally. This is critical for PSTN telephony where the echo
+round-trip is 100-500ms.
 
 Requires: libspeexdsp-dev installed on the system.
     sudo apt install libspeexdsp-dev   (Debian/Ubuntu)
 """
 from __future__ import annotations
 
-import collections
 import ctypes
 import ctypes.util
 import threading
@@ -28,33 +29,47 @@ def _load_speexdsp():
 class AEC:
     """Acoustic echo canceller backed by libspeexdsp.
 
+    Uses the asynchronous playback/capture API:
+    - feed_reference() calls speex_echo_playback() when the bot sends audio
+    - process() calls speex_echo_capture() when mic audio arrives
+
+    SpeexDSP internally manages delay alignment between the two streams,
+    so the caller doesn't need to time-synchronize them.
+
     Args:
         sample_rate: Audio sample rate in Hz (typically 8000 for telephony).
-        frame_size: Samples per frame. Must match the chunk size fed to
-            process(). Default 160 = 20 ms at 8 kHz.
-        filter_length: Adaptive filter length in samples. Longer = better
-            echo tail coverage but more CPU. Default 1600 = 200 ms at 8 kHz.
+        frame_size: Samples per frame. Default 160 = 20 ms at 8 kHz.
+        filter_length: Adaptive filter length in samples. Must cover the
+            full echo round-trip delay. Default 4000 = 500 ms at 8 kHz,
+            covering typical PSTN echo paths.
     """
 
     def __init__(
         self,
         sample_rate: int = 8000,
         frame_size: int = 160,
-        filter_length: int = 1600,
+        filter_length: int = 4000,
     ) -> None:
         self._lib = _load_speexdsp()
 
         self._lib.speex_echo_state_init.restype = ctypes.c_void_p
         self._lib.speex_echo_state_init.argtypes = [ctypes.c_int, ctypes.c_int]
-        self._lib.speex_echo_cancellation.restype = None
-        self._lib.speex_echo_cancellation.argtypes = [
+
+        self._lib.speex_echo_playback.restype = None
+        self._lib.speex_echo_playback.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16),
+        ]
+
+        self._lib.speex_echo_capture.restype = None
+        self._lib.speex_echo_capture.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_int16),
             ctypes.POINTER(ctypes.c_int16),
-            ctypes.POINTER(ctypes.c_int16),
         ]
+
         self._lib.speex_echo_state_destroy.restype = None
         self._lib.speex_echo_state_destroy.argtypes = [ctypes.c_void_p]
+
         self._lib.speex_echo_ctl.restype = ctypes.c_int
         self._lib.speex_echo_ctl.argtypes = [
             ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)
@@ -64,15 +79,16 @@ class AEC:
         if not self._state:
             raise RuntimeError("speex_echo_state_init failed")
 
-        # Set sample rate via ctl (SPEEX_ECHO_SET_SAMPLING_RATE = 24)
+        # SPEEX_ECHO_SET_SAMPLING_RATE = 24
         rate = ctypes.c_int(sample_rate)
         self._lib.speex_echo_ctl(self._state, 24, ctypes.byref(rate))
 
         self._sample_rate = sample_rate
         self._frame_size = frame_size
-        self._frame_bytes = frame_size * 2  # int16 = 2 bytes/sample
-        self._ref_buf = collections.deque(maxlen=sample_rate * 4)
+        self._frame_bytes = frame_size * 2
         self._lock = threading.Lock()
+        self._play_buf = bytearray()
+        self._mic_buf = bytearray()
 
     def __del__(self):
         if hasattr(self, "_state") and self._state:
@@ -80,43 +96,39 @@ class AEC:
             self._state = None
 
     def feed_reference(self, audio: bytes) -> None:
-        """Feed outgoing (bot) audio as the AEC reference signal."""
+        """Feed outgoing (bot) audio as the AEC reference signal.
+
+        Calls speex_echo_playback() for each frame-sized chunk. SpeexDSP
+        internally buffers this and correlates it with future mic audio.
+        """
+        self._play_buf.extend(audio)
         with self._lock:
-            self._ref_buf.extend(audio)
+            while len(self._play_buf) >= self._frame_bytes:
+                frame = bytes(self._play_buf[: self._frame_bytes])
+                self._play_buf = self._play_buf[self._frame_bytes :]
+
+                play_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(frame)
+                self._lib.speex_echo_playback(self._state, play_arr)
 
     def process(self, mic_audio: bytes) -> bytes:
-        """Remove echo from mic audio using the stored reference.
+        """Remove echo from mic audio.
 
-        Args:
-            mic_audio: Raw PCM int16 mono bytes from the caller's mic.
-
-        Returns:
-            Echo-cancelled PCM int16 mono bytes, same length as input.
+        Calls speex_echo_capture() for each frame-sized chunk. SpeexDSP
+        uses the previously-fed playback audio to cancel the echo.
         """
+        self._mic_buf.extend(mic_audio)
         out_chunks = []
-        offset = 0
-        while offset + self._frame_bytes <= len(mic_audio):
-            mic_frame = mic_audio[offset : offset + self._frame_bytes]
+        with self._lock:
+            while len(self._mic_buf) >= self._frame_bytes:
+                frame = bytes(self._mic_buf[: self._frame_bytes])
+                self._mic_buf = self._mic_buf[self._frame_bytes :]
 
-            with self._lock:
-                if len(self._ref_buf) >= self._frame_bytes:
-                    ref_bytes = bytes(
-                        [self._ref_buf.popleft() for _ in range(self._frame_bytes)]
-                    )
-                else:
-                    ref_bytes = b"\x00" * self._frame_bytes
+                mic_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(frame)
+                out_arr = (ctypes.c_int16 * self._frame_size)()
 
-            mic_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(mic_frame)
-            ref_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(ref_bytes)
-            out_arr = (ctypes.c_int16 * self._frame_size)()
-
-            self._lib.speex_echo_cancellation(
-                self._state, mic_arr, ref_arr, out_arr
-            )
-
-            out_chunks.append(bytes(out_arr))
-            offset += self._frame_bytes
+                self._lib.speex_echo_capture(self._state, mic_arr, out_arr)
+                out_chunks.append(bytes(out_arr))
 
         if not out_chunks:
-            return mic_audio
+            return b""
         return b"".join(out_chunks)
