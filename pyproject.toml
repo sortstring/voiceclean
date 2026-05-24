@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voiceclean"
-version = "0.2.0"
+version = "0.3.0"
 description = "Real-time AEC, noise suppression, and VAD for voice agents — wraps SpeexDSP, RNNoise, and Silero VAD."
 readme = "README.md"
 license = "MIT"

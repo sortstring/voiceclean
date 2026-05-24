@@ -1,211 +1,191 @@
-"""Acoustic Echo Cancellation via libspeexdsp (ctypes).
+"""Acoustic Echo Cancellation via cross-correlation detection + suppression.
 
-Two-stage pipeline:
-  1. Echo canceller (adaptive filter) — removes the bulk of the echo
-  2. Preprocessor (residual echo suppression) — catches what the
-     adaptive filter misses, especially during double-talk
+No adaptive filters. No convergence issues. No external C libraries.
 
-The preprocessor is linked to the echo canceller via
-SPEEX_PREPROCESS_SET_ECHO_STATE so it has access to the canceller's
-internal state for informed residual suppression. This is the
-recommended usage from the SpeexDSP documentation.
+The physics: echo is a delayed, attenuated copy of the reference
+signal. Cross-correlation between mic audio and the reference buffer
+reveals whether echo is present and at what delay. When detected,
+the echo component is suppressed via spectral masking.
 
-Requires: libspeexdsp-dev installed on the system.
-    sudo apt install libspeexdsp-dev   (Debian/Ubuntu)
+This replaces the SpeexDSP-based AEC which had intermittent failures
+due to adaptive filter divergence and frame balancing issues.
 """
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
 import threading
+from collections import deque
 
-
-def _load_speexdsp():
-    path = ctypes.util.find_library("speexdsp")
-    if path is None:
-        raise ImportError(
-            "libspeexdsp not found. Install it:\n"
-            "  sudo apt install libspeexdsp-dev   (Debian/Ubuntu)\n"
-            "  brew install speexdsp               (macOS)"
-        )
-    return ctypes.cdll.LoadLibrary(path)
-
-
-# SpeexDSP preprocessor constants
-_SPEEX_PREPROCESS_SET_DENOISE = 0
-_SPEEX_PREPROCESS_SET_NOISE_SUPPRESS = 18
-_SPEEX_PREPROCESS_SET_ECHO_SUPPRESS = 20
-_SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE = 22
-_SPEEX_PREPROCESS_SET_ECHO_STATE = 24
+import numpy as np
 
 
 class AEC:
-    """Acoustic echo canceller backed by libspeexdsp.
+    """Cross-correlation based echo cancellation.
 
-    Two-stage: echo canceller + preprocessor with residual echo
-    suppression. The preprocessor catches echo leakage that the
-    adaptive filter misses (double-talk, filter divergence).
+    Maintains a circular buffer of recent reference (bot) audio.
+    For each mic chunk, computes normalized cross-correlation against
+    the reference. When correlation exceeds the threshold, applies
+    spectral masking to suppress the echo while preserving any
+    uncorrelated signal (real user speech).
 
     Args:
-        sample_rate: Audio sample rate in Hz (typically 8000 for telephony).
-        frame_size: Samples per frame. Default 160 = 20 ms at 8 kHz.
-        filter_length: Adaptive filter length in samples. Must cover the
-            full echo round-trip delay. Default 4000 = 500 ms at 8 kHz.
-        echo_suppress_db: Residual echo suppression for non-active echo
-            (dB, negative). Default -60.
-        echo_suppress_active_db: Residual echo suppression during
-            double-talk (dB, negative). Default -45.
+        sample_rate: Audio sample rate in Hz.
+        chunk_ms: Analysis chunk size in milliseconds. Larger chunks
+            give more reliable correlation but add latency. Default 40ms.
+        buffer_ms: Reference buffer length in milliseconds. Must cover
+            the maximum expected echo delay. Default 800ms.
+        correlation_threshold: Normalized cross-correlation above which
+            echo is considered present. Default 0.15.
+        suppress_db: How much to suppress detected echo (dB). Default -30.
     """
 
     def __init__(
         self,
         sample_rate: int = 8000,
-        frame_size: int = 160,
-        filter_length: int = 4000,
-        echo_suppress_db: int = -60,
-        echo_suppress_active_db: int = -45,
+        chunk_ms: int = 40,
+        buffer_ms: int = 800,
+        correlation_threshold: float = 0.15,
+        suppress_db: float = -30.0,
+        **kwargs,
     ) -> None:
-        self._lib = _load_speexdsp()
-
-        # Echo canceller
-        self._lib.speex_echo_state_init.restype = ctypes.c_void_p
-        self._lib.speex_echo_state_init.argtypes = [ctypes.c_int, ctypes.c_int]
-        self._lib.speex_echo_playback.restype = None
-        self._lib.speex_echo_playback.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16),
-        ]
-        self._lib.speex_echo_capture.restype = None
-        self._lib.speex_echo_capture.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_int16),
-            ctypes.POINTER(ctypes.c_int16),
-        ]
-        self._lib.speex_echo_state_destroy.restype = None
-        self._lib.speex_echo_state_destroy.argtypes = [ctypes.c_void_p]
-        self._lib.speex_echo_ctl.restype = ctypes.c_int
-        self._lib.speex_echo_ctl.argtypes = [
-            ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int)
-        ]
-
-        # Preprocessor
-        self._lib.speex_preprocess_state_init.restype = ctypes.c_void_p
-        self._lib.speex_preprocess_state_init.argtypes = [ctypes.c_int, ctypes.c_int]
-        self._lib.speex_preprocess_state_destroy.restype = None
-        self._lib.speex_preprocess_state_destroy.argtypes = [ctypes.c_void_p]
-        self._lib.speex_preprocess_run.restype = ctypes.c_int
-        self._lib.speex_preprocess_run.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16),
-        ]
-
-        # Initialize echo canceller
-        self._echo_state = self._lib.speex_echo_state_init(frame_size, filter_length)
-        if not self._echo_state:
-            raise RuntimeError("speex_echo_state_init failed")
-
-        # SPEEX_ECHO_SET_SAMPLING_RATE = 24
-        rate = ctypes.c_int(sample_rate)
-        self._lib.speex_echo_ctl(self._echo_state, 24, ctypes.byref(rate))
-
-        # Initialize preprocessor and link to echo canceller
-        self._preprocess = self._lib.speex_preprocess_state_init(frame_size, sample_rate)
-        if not self._preprocess:
-            raise RuntimeError("speex_preprocess_state_init failed")
-
-        def _pp_ctl(request: int, value):
-            """Helper: speex_preprocess_ctl with explicit void* casting."""
-            self._lib.speex_preprocess_ctl(
-                ctypes.c_void_p(self._preprocess),
-                ctypes.c_int(request),
-                value,
-            )
-
-        # Link preprocessor to echo canceller for residual echo
-        # suppression. SET_ECHO_STATE takes the echo state directly
-        # as a void*, not a pointer-to-pointer.
-        _pp_ctl(_SPEEX_PREPROCESS_SET_ECHO_STATE,
-                ctypes.c_void_p(self._echo_state))
-
-        # Residual echo suppression: how aggressively to suppress
-        # echo that the adaptive filter missed (-60 dB)
-        suppress = ctypes.c_int(echo_suppress_db)
-        _pp_ctl(_SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, ctypes.byref(suppress))
-
-        # During double-talk: less aggressive to preserve real speech (-45 dB)
-        suppress_active = ctypes.c_int(echo_suppress_active_db)
-        _pp_ctl(_SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE,
-                ctypes.byref(suppress_active))
-
-        # Enable noise suppression in the preprocessor
-        denoise = ctypes.c_int(1)
-        _pp_ctl(_SPEEX_PREPROCESS_SET_DENOISE, ctypes.byref(denoise))
-        noise_suppress = ctypes.c_int(-30)
-        _pp_ctl(_SPEEX_PREPROCESS_SET_NOISE_SUPPRESS, ctypes.byref(noise_suppress))
-
         self._sample_rate = sample_rate
-        self._frame_size = frame_size
-        self._frame_bytes = frame_size * 2
-        self._lock = threading.Lock()
-        self._play_buf = bytearray()
-        self._mic_buf = bytearray()
-        self._play_frames = 0
-        self._capture_frames = 0
-        self._silence_frame = (ctypes.c_int16 * frame_size)()
+        self._chunk_samples = int(sample_rate * chunk_ms / 1000)
+        self._chunk_bytes = self._chunk_samples * 2
+        self._buffer_samples = int(sample_rate * buffer_ms / 1000)
+        self._correlation_threshold = correlation_threshold
+        self._suppress_gain = 10.0 ** (suppress_db / 20.0)
 
-    def __del__(self):
-        if hasattr(self, "_preprocess") and self._preprocess:
-            self._lib.speex_preprocess_state_destroy(self._preprocess)
-            self._preprocess = None
-        if hasattr(self, "_echo_state") and self._echo_state:
-            self._lib.speex_echo_state_destroy(self._echo_state)
-            self._echo_state = None
+        # FFT size for cross-correlation (next power of 2)
+        self._fft_size = 1
+        while self._fft_size < self._buffer_samples + self._chunk_samples:
+            self._fft_size *= 2
+
+        self._lock = threading.Lock()
+        # Circular buffer of recent reference audio (float64)
+        self._ref_ring = np.zeros(self._buffer_samples, dtype=np.float64)
+        self._ref_write_pos = 0
+        self._ref_energy_valid = False
+
+        # Buffering for mic and reference input
+        self._mic_buf = bytearray()
+        self._ref_buf = bytearray()
 
     def feed_reference(self, audio: bytes) -> None:
-        """Feed outgoing (bot) audio as the AEC reference signal."""
-        self._play_buf.extend(audio)
-        with self._lock:
-            while len(self._play_buf) >= self._frame_bytes:
-                frame = bytes(self._play_buf[: self._frame_bytes])
-                self._play_buf = self._play_buf[self._frame_bytes :]
+        """Feed bot's outgoing audio into the reference ring buffer."""
+        self._ref_buf.extend(audio)
+        # Write to ring buffer in chunk-sized pieces
+        while len(self._ref_buf) >= self._chunk_bytes:
+            chunk = self._ref_buf[:self._chunk_bytes]
+            self._ref_buf = self._ref_buf[self._chunk_bytes:]
 
-                play_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(frame)
-                if self._play_frames >= self._capture_frames:
-                    self._lib.speex_echo_capture(
-                        self._echo_state, self._silence_frame, self._silence_frame,
-                    )
-                    self._lib.speex_preprocess_run(self._preprocess, self._silence_frame)
-                    self._capture_frames += 1
-                self._lib.speex_echo_playback(self._echo_state, play_arr)
-                self._play_frames += 1
+            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float64)
+            n = len(samples)
+            pos = self._ref_write_pos
+
+            with self._lock:
+                if pos + n <= self._buffer_samples:
+                    self._ref_ring[pos:pos + n] = samples
+                else:
+                    first = self._buffer_samples - pos
+                    self._ref_ring[pos:] = samples[:first]
+                    self._ref_ring[:n - first] = samples[first:]
+                self._ref_write_pos = (pos + n) % self._buffer_samples
+                self._ref_energy_valid = True
 
     def process(self, mic_audio: bytes) -> bytes:
-        """Remove echo from mic audio.
-
-        Two-stage: echo canceller removes bulk echo, then preprocessor
-        applies residual echo suppression + noise suppression.
-        """
+        """Process mic audio: detect and suppress echo."""
         self._mic_buf.extend(mic_audio)
         out_chunks = []
-        with self._lock:
-            while len(self._mic_buf) >= self._frame_bytes:
-                frame = bytes(self._mic_buf[: self._frame_bytes])
-                self._mic_buf = self._mic_buf[self._frame_bytes :]
 
-                if self._capture_frames >= self._play_frames:
-                    self._lib.speex_echo_playback(self._echo_state, self._silence_frame)
-                    self._play_frames += 1
+        while len(self._mic_buf) >= self._chunk_bytes:
+            chunk = bytes(self._mic_buf[:self._chunk_bytes])
+            self._mic_buf = self._mic_buf[self._chunk_bytes:]
 
-                mic_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(frame)
-                out_arr = (ctypes.c_int16 * self._frame_size)()
+            mic = np.frombuffer(chunk, dtype=np.int16).astype(np.float64)
 
-                # Stage 1: adaptive echo cancellation
-                self._lib.speex_echo_capture(self._echo_state, mic_arr, out_arr)
+            with self._lock:
+                if not self._ref_energy_valid:
+                    out_chunks.append(chunk)
+                    continue
+                ref = self._ref_ring.copy()
 
-                # Stage 2: residual echo suppression + noise suppression
-                self._lib.speex_preprocess_run(self._preprocess, out_arr)
-
-                out_chunks.append(bytes(out_arr))
-                self._capture_frames += 1
+            result = self._process_chunk(mic, ref)
+            out_chunks.append(
+                np.clip(result, -32768, 32767).astype(np.int16).tobytes()
+            )
 
         if not out_chunks:
             return b""
         return b"".join(out_chunks)
+
+    def _process_chunk(self, mic: np.ndarray, ref: np.ndarray) -> np.ndarray:
+        """Core processing: correlate, detect, suppress."""
+        mic_energy = np.sum(mic ** 2)
+        if mic_energy < 1e-6:
+            return mic
+
+        ref_energy = np.sum(ref ** 2)
+        if ref_energy < 1e-6:
+            return mic
+
+        # Normalized cross-correlation via FFT
+        mic_padded = np.zeros(self._fft_size)
+        mic_padded[:len(mic)] = mic
+        ref_padded = np.zeros(self._fft_size)
+        ref_padded[:len(ref)] = ref
+
+        mic_fft = np.fft.rfft(mic_padded)
+        ref_fft = np.fft.rfft(ref_padded)
+
+        xcorr = np.fft.irfft(mic_fft * np.conj(ref_fft))
+
+        # Normalize by geometric mean of energies
+        norm = np.sqrt(mic_energy * ref_energy)
+        if norm < 1e-10:
+            return mic
+        xcorr_norm = np.abs(xcorr) / norm
+
+        peak_corr = np.max(xcorr_norm)
+
+        if peak_corr < self._correlation_threshold:
+            return mic
+
+        # Echo detected — apply spectral suppression
+        peak_lag = np.argmax(xcorr_norm)
+
+        # Extract the reference segment at the detected lag
+        ref_at_lag = np.zeros_like(mic)
+        for i in range(len(mic)):
+            idx = (peak_lag + i) % len(ref)
+            ref_at_lag[i] = ref[idx]
+
+        ref_lag_energy = np.sum(ref_at_lag ** 2)
+        if ref_lag_energy < 1e-6:
+            return mic
+
+        # Spectral masking: suppress frequency bins where echo dominates
+        n_fft = len(mic)
+        mic_spec = np.fft.rfft(mic, n_fft)
+        ref_spec = np.fft.rfft(ref_at_lag, n_fft)
+
+        mic_mag = np.abs(mic_spec)
+        ref_mag = np.abs(ref_spec)
+
+        # Gain mask: reduce bins where reference (echo) is strong
+        # relative to the mic signal
+        echo_ratio = ref_mag / (mic_mag + 1e-10)
+
+        # Scale by correlation strength — higher correlation = more
+        # confident echo detection = more aggressive suppression
+        suppression_strength = min(peak_corr / self._correlation_threshold, 3.0)
+
+        gain = np.ones_like(mic_mag)
+        echo_bins = echo_ratio > 0.3
+        gain[echo_bins] = np.maximum(
+            self._suppress_gain,
+            1.0 - suppression_strength * echo_ratio[echo_bins],
+        )
+
+        result_spec = mic_spec * gain
+        result = np.fft.irfft(result_spec, n_fft)
+
+        return result[:len(mic)]

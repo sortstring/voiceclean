@@ -42,15 +42,8 @@ class VoiceClean:
         self._denoiser = None
         self._vad = None
 
-        try:
-            from voiceclean.aec import AEC
-            self._aec = AEC(
-                sample_rate=sample_rate,
-                frame_size=aec_frame_size,
-                filter_length=aec_filter_length,
-            )
-        except (ImportError, OSError) as e:
-            logger.warning("AEC disabled — libspeexdsp not available: %s", e)
+        from voiceclean.aec import AEC
+        self._aec = AEC(sample_rate=sample_rate)
 
         try:
             from voiceclean.denoise import Denoiser
