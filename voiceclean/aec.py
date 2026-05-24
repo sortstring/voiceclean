@@ -91,6 +91,7 @@ class AEC:
         self._mic_buf = bytearray()
         self._play_frames = 0
         self._capture_frames = 0
+        self._silence_frame = (ctypes.c_int16 * frame_size)()
 
     def __del__(self):
         if hasattr(self, "_state") and self._state:
@@ -125,6 +126,12 @@ class AEC:
             while len(self._mic_buf) >= self._frame_bytes:
                 frame = bytes(self._mic_buf[: self._frame_bytes])
                 self._mic_buf = self._mic_buf[self._frame_bytes :]
+
+                # Feed silence as playback when the bot isn't speaking,
+                # so SpeexDSP's capture/playback frame counts stay balanced.
+                if self._capture_frames >= self._play_frames:
+                    self._lib.speex_echo_playback(self._state, self._silence_frame)
+                    self._play_frames += 1
 
                 mic_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(frame)
                 out_arr = (ctypes.c_int16 * self._frame_size)()
