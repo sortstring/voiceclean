@@ -111,6 +111,13 @@ class AEC:
                 self._play_buf = self._play_buf[self._frame_bytes :]
 
                 play_arr = (ctypes.c_int16 * self._frame_size).from_buffer_copy(frame)
+                # Feed silence as capture when playback gets ahead,
+                # so SpeexDSP's frame counts stay balanced.
+                if self._play_frames >= self._capture_frames:
+                    self._lib.speex_echo_capture(
+                        self._state, self._silence_frame, self._silence_frame,
+                    )
+                    self._capture_frames += 1
                 self._lib.speex_echo_playback(self._state, play_arr)
                 self._play_frames += 1
 
