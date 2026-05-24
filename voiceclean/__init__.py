@@ -10,7 +10,7 @@ only what you need.
     pip install voiceclean[silero]    # VAD only
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from voiceclean.pipeline import ProcessResult, VoiceClean
 
