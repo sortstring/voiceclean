@@ -77,7 +77,7 @@ class VoiceClean:
         return self._vad is not None
 
     def feed_reference(self, audio: bytes) -> None:
-        """Feed outgoing (bot) audio as the AEC reference signal."""
+        """Feed outgoing (bot) audio as AEC reference signal."""
         if self._aec is not None:
             self._aec.feed_reference(audio)
 

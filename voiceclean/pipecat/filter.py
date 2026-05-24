@@ -120,11 +120,6 @@ class VoiceCleanFilter(BaseAudioFilter):
         if self._bypass or len(audio) == 0:
             return audio
 
-        # Run AEC only — VAD is driven separately by the VADAnalyzer.
-        # RNNoise denoiser is disabled: it operates at 48kHz internally
-        # and the double resample (8k→48k→8k) degrades narrowband
-        # telephony audio quality. AEC alone removes the echo; the
-        # remaining noise floor is acceptable for STT.
         cleaned = audio
         if self._vc._aec is not None:
             cleaned = self._vc._aec.process(cleaned)
