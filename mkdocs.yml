@@ -1,0 +1,49 @@
+site_name: voiceclean
+site_url: !ENV [READTHEDOCS_CANONICAL_URL, "https://voiceclean.readthedocs.io/"]
+site_description: Real-time acoustic echo cancellation and voice activity detection for voice agents.
+repo_url: https://github.com/sortstring/voiceclean
+repo_name: sortstring/voiceclean
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.expand
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - How AEC Works: how-aec-works.md
+  - API Reference:
+    - VoiceClean: api/voiceclean.md
+    - AEC: api/aec.md
+    - VAD: api/vad.md
+    - Pipecat Integration: api/pipecat.md
+  - Configuration: configuration.md
+  - Pipecat Guide: pipecat-guide.md
+  - Background: background.md
