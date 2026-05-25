@@ -8,7 +8,7 @@ at any sample rate.
     pip install voiceclean[silero] # VAD only
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 from voiceclean.pipeline import ProcessResult, VoiceClean
 

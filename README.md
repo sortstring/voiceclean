@@ -1,6 +1,12 @@
 # voiceclean
 
-Real-time acoustic echo cancellation (AEC), noise suppression, and voice activity detection (VAD) for voice agents. Built for telephony (8 kHz PSTN audio), works at any sample rate. No external C libraries — pure Python + numpy.
+[![PyPI](https://img.shields.io/pypi/v/voiceclean)](https://pypi.org/project/voiceclean/)
+[![Documentation](https://readthedocs.org/projects/voiceclean/badge/?version=latest)](https://voiceclean.readthedocs.io/en/latest/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+
+Real-time acoustic echo cancellation (AEC) and voice activity detection (VAD) for voice agents. Built for telephony (8 kHz PSTN audio), works at any sample rate. No external C libraries — pure Python + numpy.
+
+**[Documentation](https://voiceclean.readthedocs.io)** | **[PyPI](https://pypi.org/project/voiceclean/)** | **[GitHub](https://github.com/sortstring/voiceclean)**
 
 | Feature | How it works | Library |
 |---------|-------------|---------|
