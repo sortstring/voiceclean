@@ -1,39 +1,29 @@
 # voiceclean
 
-Real-time acoustic echo cancellation (AEC), noise suppression, and voice activity detection (VAD) for voice agents. Built for telephony (8 kHz PSTN audio), works at any sample rate.
+Real-time acoustic echo cancellation (AEC), noise suppression, and voice activity detection (VAD) for voice agents. Built for telephony (8 kHz PSTN audio), works at any sample rate. No external C libraries — pure Python + numpy.
 
-Wraps three proven open-source libraries into a single Python package:
-
-| Feature | Library | What it does |
-|---------|---------|-------------|
-| **AEC** | [SpeexDSP](https://github.com/xiph/speexdsp) | Removes the bot's own speech from the caller's mic signal. Essential when the telephony provider doesn't do carrier-side echo cancellation. |
-| **Noise suppression** | [RNNoise](https://github.com/xiph/rnnoise) via [pyrnnoise](https://pypi.org/project/pyrnnoise/) | Neural noise reduction. Best at 48 kHz; for 8 kHz telephony, AEC alone is usually sufficient. |
-| **VAD** | [Silero VAD](https://github.com/snakers4/silero-vad) | Detects speech vs silence. <1 ms per chunk on CPU, 8 kHz native support, ~2 MB ONNX model. |
+| Feature | How it works | Library |
+|---------|-------------|---------|
+| **AEC** | Cross-correlation echo detection + spectral masking. Detects echo by correlating mic audio against a reference buffer of bot output, then suppresses the correlated component. No adaptive filters, no convergence issues. | numpy (built-in) |
+| **VAD** | Neural voice activity detection. <1 ms per chunk on CPU, 8 kHz native support, ~2 MB ONNX model. | [Silero VAD](https://github.com/snakers4/silero-vad) |
 
 ## Why this exists
 
-Cloud telephony providers like Twilio perform echo cancellation on their infrastructure before delivering audio to your WebSocket. Others (like Exotel) don't — the bot's TTS output bleeds through the caller's mic and gets transcribed as user input, creating a self-conversation loop.
+Voice agents that call people over PSTN have an echo problem: the bot's TTS audio plays through the phone speaker, couples back through the mic, and gets transcribed as user input. The bot starts responding to its own words.
 
-Commercial solutions like ai-coustics ($149/mo) provide noise suppression and VAD but not AEC. voiceclean fills that gap with open-source components.
+Some telephony providers (like Twilio) perform echo cancellation on their infrastructure. Others (like Exotel) don't. And even Twilio's AEC isn't perfect — in noisy environments, the audio quality degrades.
+
+Commercial solutions like ai-coustics ($149/mo) provide noise suppression and VAD but not echo cancellation. voiceclean provides AEC + VAD as a single open-source package — free, no API keys, no network calls.
+
+**Tested in production** on both Twilio and Exotel with real PSTN calls in Hindi, English, and Nepali. Handles noisy environments (multiple people talking in the background) where commercial alternatives fail.
 
 ## Install
 
 ```bash
-pip install voiceclean            # core (numpy + soxr only)
-pip install voiceclean[all]       # AEC + noise suppression + VAD + Pipecat integration
-pip install voiceclean[silero]    # VAD only
-pip install voiceclean[rnnoise]   # noise suppression only
+pip install voiceclean
 ```
 
-**System dependency for AEC** — libspeexdsp must be installed on the host:
-
-```bash
-# Debian / Ubuntu
-sudo apt install libspeexdsp-dev
-
-# macOS
-brew install speexdsp
-```
+No system dependencies. No C libraries. Just numpy + soxr + onnxruntime.
 
 ## Quick start
 
@@ -58,17 +48,12 @@ result.speech_prob  # float 0.0–1.0
 
 ```python
 from voiceclean.aec import AEC
-from voiceclean.denoise import Denoiser
 from voiceclean.vad import VAD
 
 # Echo cancellation
-aec = AEC(sample_rate=8000, filter_length=4000)
+aec = AEC(sample_rate=8000)
 aec.feed_reference(bot_audio)
 clean = aec.process(mic_audio)
-
-# Noise suppression (best at 48 kHz; resamples internally)
-denoiser = Denoiser(sample_rate=8000)
-clean = denoiser.process(noisy_audio)
 
 # Voice activity detection
 vad = VAD(sample_rate=8000, threshold=0.5)
@@ -77,7 +62,7 @@ result = vad.process(audio)  # result.is_speech, result.speech_prob
 
 ### Pipecat integration
 
-voiceclean plugs into [Pipecat](https://github.com/pipecat-ai/pipecat) as a `BaseAudioFilter` + `VADAnalyzer`. The key design: a `reference_collector` FrameProcessor captures outgoing audio for the AEC reference signal.
+voiceclean plugs into [Pipecat](https://github.com/pipecat-ai/pipecat) as a `BaseAudioFilter` + `VADAnalyzer`. The `reference_collector` FrameProcessor captures outgoing audio for the AEC reference signal.
 
 ```python
 from voiceclean.pipecat import VoiceCleanFilter
@@ -115,36 +100,55 @@ pipeline = Pipeline([
 Echo cancellation needs two audio streams:
 
 1. **Reference signal** — what the bot is sending to the speaker (outgoing TTS audio)
-2. **Mic signal** — what the caller's mic picks up (speech + echo of the bot)
+2. **Mic signal** — what the caller's mic picks up (user speech + echo of the bot)
 
-SpeexDSP's adaptive filter learns the echo path (including network delay, acoustic coupling, codec artifacts) and subtracts the predicted echo from the mic signal. The async playback/capture API handles delay alignment internally — you don't need to time-synchronize the two streams.
+For each chunk of mic audio, voiceclean:
+
+1. Computes **normalized cross-correlation** (via FFT) against a ring buffer of recent reference audio
+2. If the peak correlation exceeds the threshold → echo is present at that lag
+3. Applies **spectral masking**: frequency bins where echo dominates are suppressed, bins with uncorrelated energy (real speech) are preserved
+4. If correlation is below threshold → no echo → audio passes through unchanged
 
 ```
-Bot TTS audio ──► feed_reference() ──► SpeexDSP learns echo path
+Bot TTS audio ──► feed_reference() ──► reference ring buffer
                                               │
-Caller mic audio ──► process() ─────► SpeexDSP subtracts echo ──► clean audio
+                                    cross-correlation
+                                              │
+Caller mic audio ──► process() ──► spectral masking ──► clean audio
 ```
 
-**Filter length**: Default 4000 samples = 500 ms at 8 kHz. This must cover the full echo round-trip delay (typically 100–500 ms on PSTN). Increase if you hear residual echo on high-latency paths.
+This approach is fundamentally different from adaptive-filter AEC (like SpeexDSP or WebRTC AEC3):
+
+| | Adaptive filter (SpeexDSP) | Cross-correlation (voiceclean) |
+|---|---|---|
+| **How it works** | Builds a linear model of the echo path, adapts over time | Detects echo presence by correlation, suppresses via spectral mask |
+| **Convergence** | Needs time to adapt; can diverge | No convergence — stateless per-chunk |
+| **Consistency** | Intermittent failures (~50% of calls in our testing) | Consistent on every frame |
+| **Non-linear echo** | Fails (linear model can't represent speaker distortion) | Works (correlation survives non-linear distortion) |
+| **Dependencies** | Requires libspeexdsp (C library) | Pure numpy |
 
 ## Audio format
 
 All audio is **PCM int16 mono** (signed 16-bit little-endian, single channel). This is the standard format for telephony audio and what Pipecat's frame processors use internally.
 
-## Notes on RNNoise
+## AEC parameters
 
-RNNoise operates at 48 kHz internally. For 8 kHz telephony audio, it resamples up and back (8k → 48k → 8k), which can degrade narrowband speech quality. In telephony applications, **AEC alone is usually sufficient** — the PSTN noise floor is low enough for STT accuracy. The Pipecat filter disables RNNoise by default for this reason.
+```python
+AEC(
+    sample_rate=8000,           # Audio sample rate in Hz
+    chunk_ms=40,                # Analysis chunk size (ms). Larger = more reliable, more latency
+    buffer_ms=800,              # Reference buffer length (ms). Must cover max echo delay
+    correlation_threshold=0.15, # Cross-correlation above which echo is detected
+    suppress_db=-30.0,          # How much to suppress detected echo (dB)
+)
+```
 
-RNNoise works well for wideband (16 kHz+) applications where the full frequency range benefits from neural denoising.
+For most telephony applications, the defaults work well. Increase `buffer_ms` if you're on a high-latency PSTN path (e.g., international calls).
 
 ## Credits
 
-This package wraps open-source libraries by their respective authors:
-
-- **SpeexDSP** — Jean-Marc Valin / [Xiph.Org Foundation](https://xiph.org/) (BSD License)
-- **RNNoise** — Jean-Marc Valin / [Xiph.Org Foundation](https://xiph.org/) (BSD-3-Clause License)
 - **Silero VAD** — [Silero Team](https://github.com/snakers4/silero-vad) (MIT License)
 
 ## License
 
-MIT
+MIT — [SortString Solutions](https://github.com/sortstring)
