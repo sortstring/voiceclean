@@ -16,10 +16,11 @@ class VoiceCleanFilter(BaseAudioFilter):
         self,
         sample_rate: int = 8000,
         vad_threshold: float = 0.5,
+        **aec_kwargs,
     )
 ```
 
-Pipecat audio input filter backed by voiceclean. Provides AEC on the input audio path and exposes a VAD analyzer for turn detection.
+Pipecat audio input filter backed by voiceclean. Provides AEC on the input audio path and exposes a VAD analyzer for turn detection. Any additional keyword arguments are passed through to the underlying `AEC` constructor.
 
 **Parameters:**
 
@@ -27,6 +28,7 @@ Pipecat audio input filter backed by voiceclean. Provides AEC on the input audio
 |-----------|------|---------|-------------|
 | `sample_rate` | `int` | `8000` | Audio sample rate in Hz |
 | `vad_threshold` | `float` | `0.5` | Speech probability threshold for VAD |
+| `**aec_kwargs` | | | Passed to `AEC()` — e.g. `correlation_threshold`, `buffer_ms`, `suppress_db`, `chunk_ms` |
 
 ### Properties
 
@@ -100,7 +102,7 @@ Returns speech probability (0.0–1.0) for the given audio buffer.
 See [Pipecat Guide](../pipecat-guide.md) for the complete integration walkthrough.
 
 ```python
-vc_filter = VoiceCleanFilter(sample_rate=8000)
+vc_filter = VoiceCleanFilter(sample_rate=8000, correlation_threshold=0.10)
 
 transport = FastAPIWebsocketTransport(
     websocket=websocket,

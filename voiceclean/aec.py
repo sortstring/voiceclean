@@ -69,6 +69,50 @@ class AEC:
         self._mic_buf = bytearray()
         self._ref_buf = bytearray()
 
+        # Per-call correlation stats
+        self._total_chunks = 0
+        self._echo_chunks = 0
+        self._peak_correlations: list[float] = []
+        self._suppressed_lags: list[int] = []
+
+    def get_stats(self) -> dict:
+        """Return per-call correlation statistics."""
+        corrs = self._peak_correlations
+        if not corrs:
+            return {
+                "total_chunks": 0,
+                "echo_chunks": 0,
+                "echo_pct": 0.0,
+                "correlation_min": 0.0,
+                "correlation_max": 0.0,
+                "correlation_mean": 0.0,
+                "correlation_p50": 0.0,
+                "correlation_p95": 0.0,
+                "threshold": self._correlation_threshold,
+            }
+        arr = np.array(corrs)
+        lags = self._suppressed_lags
+        lag_arr = np.array(lags) if lags else np.array([], dtype=np.int64)
+        lag_stats = {}
+        if len(lag_arr) > 0:
+            lag_stats = {
+                "lag_min_ms": round(float(np.min(lag_arr)) / self._sample_rate * 1000, 1),
+                "lag_max_ms": round(float(np.max(lag_arr)) / self._sample_rate * 1000, 1),
+                "lag_mean_ms": round(float(np.mean(lag_arr)) / self._sample_rate * 1000, 1),
+            }
+        return {
+            "total_chunks": self._total_chunks,
+            "echo_chunks": self._echo_chunks,
+            "echo_pct": round(100 * self._echo_chunks / self._total_chunks, 1),
+            "correlation_min": round(float(np.min(arr)), 4),
+            "correlation_max": round(float(np.max(arr)), 4),
+            "correlation_mean": round(float(np.mean(arr)), 4),
+            "correlation_p50": round(float(np.median(arr)), 4),
+            "correlation_p95": round(float(np.percentile(arr, 95)), 4),
+            "threshold": self._correlation_threshold,
+            **lag_stats,
+        }
+
     def feed_reference(self, audio: bytes) -> None:
         """Feed bot's outgoing audio into the reference ring buffer."""
         self._ref_buf.extend(audio)
@@ -146,11 +190,16 @@ class AEC:
 
         peak_corr = np.max(xcorr_norm)
 
+        self._total_chunks += 1
+        self._peak_correlations.append(float(peak_corr))
+
         if peak_corr < self._correlation_threshold:
             return mic
 
         # Echo detected — apply spectral suppression
         peak_lag = np.argmax(xcorr_norm)
+        self._echo_chunks += 1
+        self._suppressed_lags.append(int(peak_lag))
 
         # Extract the reference segment at the detected lag
         ref_at_lag = np.zeros_like(mic)

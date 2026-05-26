@@ -71,7 +71,7 @@ voiceclean/
 
 1. Bot's outgoing audio is fed into a **ring buffer** via `feed_reference()`.
 2. For each mic chunk (40 ms), compute **normalized cross-correlation** (FFT) against the ring buffer.
-3. If the peak correlation exceeds `correlation_threshold` (0.15) → echo is present at that lag.
+3. If the peak correlation exceeds `correlation_threshold` (default 0.15, recommended 0.10 for telephony) → echo is present at that lag.
 4. **Spectral masking**: suppress frequency bins where echo dominates; preserve bins with uncorrelated energy (real speech).
 5. If correlation is below threshold → no echo → audio passes through unchanged.
 
@@ -90,7 +90,7 @@ Read `docs/how-aec-works.md` or `voiceclean/aec.py` for the full algorithm.
 | `sample_rate` | 8000 | Audio sample rate in Hz |
 | `chunk_ms` | 40 | Analysis chunk size (ms). Larger = more reliable, more latency |
 | `buffer_ms` | 800 | Reference ring buffer length (ms). Must cover max echo delay. Increase for international calls. |
-| `correlation_threshold` | 0.15 | Cross-correlation above which echo is detected. Lower = catches weaker echo but more false positives. |
+| `correlation_threshold` | 0.15 | Cross-correlation above which echo is detected. Lower = catches weaker echo but more false positives. **0.10 recommended for telephony** — production data showed borderline echo at p95 0.13–0.15 slipping through on ~14% of Exotel calls. Normal speech correlates at 0.01–0.08. |
 | `suppress_db` | -30.0 | Echo suppression depth (dB). -30 = echo at ~3% of original. |
 
 ## VAD (`voiceclean/vad.py`)

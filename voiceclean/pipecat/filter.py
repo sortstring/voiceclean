@@ -74,16 +74,14 @@ class VoiceCleanFilter(BaseAudioFilter):
     def __init__(
         self,
         sample_rate: int = 8000,
-        aec_filter_length: int = 4000,
-        aec_frame_size: int = 160,
         vad_threshold: float = 0.5,
+        **aec_kwargs,
     ) -> None:
         self._sample_rate = sample_rate
         self._vc = VoiceClean(
             sample_rate=sample_rate,
-            aec_filter_length=aec_filter_length,
-            aec_frame_size=aec_frame_size,
             vad_threshold=vad_threshold,
+            **aec_kwargs,
         )
         self._bypass = False
         self._ref_collector = _ReferenceCollector(self._vc)

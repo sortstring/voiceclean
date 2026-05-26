@@ -44,10 +44,10 @@ Normalized cross-correlation peak above which echo is considered present. Range:
 
 - **Lower** = more aggressive echo detection (catches weaker echo, but may false-trigger on speech)
 - **Higher** = more conservative (misses weak echo, but fewer false positives)
-- **Default: 0.15** — tuned for 8 kHz PSTN audio
+- **Default: 0.15** — but production testing on Exotel PSTN calls showed that borderline echo (correlation p95 of 0.13–0.15) can slip through. **0.10 is recommended** for telephony deployments. Normal speech correlates at 0.01–0.08, so 0.10 has adequate margin.
 
 !!! tip
-    If you see echo leaking through, try lowering to 0.10. If user speech is being suppressed, raise to 0.20.
+    If echo still leaks through at 0.10, try 0.08. If user speech is being suppressed, raise back to 0.15 or 0.20.
 
 ### `suppress_db`
 

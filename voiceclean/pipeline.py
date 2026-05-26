@@ -32,9 +32,8 @@ class VoiceClean:
     def __init__(
         self,
         sample_rate: int = 8000,
-        aec_filter_length: int = 1600,
-        aec_frame_size: int = 160,
         vad_threshold: float = 0.5,
+        **aec_kwargs,
     ) -> None:
         self._sample_rate = sample_rate
 
@@ -43,7 +42,7 @@ class VoiceClean:
         self._vad = None
 
         from voiceclean.aec import AEC
-        self._aec = AEC(sample_rate=sample_rate)
+        self._aec = AEC(sample_rate=sample_rate, **aec_kwargs)
 
         try:
             from voiceclean.denoise import Denoiser
@@ -105,3 +104,9 @@ class VoiceClean:
             is_speech=is_speech,
             speech_prob=speech_prob,
         )
+
+    def get_aec_stats(self) -> dict | None:
+        """Return AEC correlation stats for this call, or None if no AEC."""
+        if self._aec is None:
+            return None
+        return self._aec.get_stats()

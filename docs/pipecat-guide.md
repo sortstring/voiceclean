@@ -24,7 +24,7 @@ Both are created from a single `VoiceCleanFilter` instance, ensuring they share 
 ```python
 from voiceclean.pipecat import VoiceCleanFilter
 
-vc_filter = VoiceCleanFilter(sample_rate=8000)
+vc_filter = VoiceCleanFilter(sample_rate=8000, correlation_threshold=0.10)
 ```
 
 ### 2. Wire as audio input filter
