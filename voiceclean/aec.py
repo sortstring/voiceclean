@@ -34,8 +34,18 @@ class AEC:
         buffer_ms: Reference buffer length in milliseconds. Must cover
             the maximum expected echo delay. Default 800ms.
         correlation_threshold: Normalized cross-correlation above which
-            echo is considered present. Default 0.15.
+            echo is *considered*. Default 0.15. Unchanged in v0.3.4 —
+            real echo at this sample rate often sits at 0.13–0.20, so
+            raising the threshold would miss real bleed. The false-
+            positive case (user repeating bot vocabulary) is now handled
+            by min_echo_ratio instead.
         suppress_db: How much to suppress detected echo (dB). Default -30.
+        min_echo_ratio: Reference-at-lag energy / mic energy below which
+            a chunk is *not* considered echo even if the correlation peak
+            crosses threshold. Default 0.5. The intuition: real echo
+            dominates the mic signal; incidental phonetic similarity does
+            not. Set to 0.0 to disable this gate and restore pre-v0.3.4
+            detection behaviour.
     """
 
     def __init__(
@@ -45,6 +55,7 @@ class AEC:
         buffer_ms: int = 800,
         correlation_threshold: float = 0.15,
         suppress_db: float = -30.0,
+        min_echo_ratio: float = 0.5,
         **kwargs,
     ) -> None:
         self._sample_rate = sample_rate
@@ -53,6 +64,7 @@ class AEC:
         self._buffer_samples = int(sample_rate * buffer_ms / 1000)
         self._correlation_threshold = correlation_threshold
         self._suppress_gain = 10.0 ** (suppress_db / 20.0)
+        self._min_echo_ratio = min_echo_ratio
 
         # FFT size for cross-correlation (next power of 2)
         self._fft_size = 1
@@ -72,6 +84,10 @@ class AEC:
         # Per-call correlation stats
         self._total_chunks = 0
         self._echo_chunks = 0
+        # Chunks whose correlation crossed threshold but were skipped by
+        # the EMR gate (ref-at-lag too quiet vs mic). Tracked to make the
+        # gate's behaviour visible in production without re-instrumenting.
+        self._emr_blocked_chunks = 0
         self._peak_correlations: list[float] = []
         self._suppressed_lags: list[int] = []
 
@@ -83,12 +99,15 @@ class AEC:
                 "total_chunks": 0,
                 "echo_chunks": 0,
                 "echo_pct": 0.0,
+                "emr_blocked_chunks": 0,
+                "emr_blocked_pct": 0.0,
                 "correlation_min": 0.0,
                 "correlation_max": 0.0,
                 "correlation_mean": 0.0,
                 "correlation_p50": 0.0,
                 "correlation_p95": 0.0,
                 "threshold": self._correlation_threshold,
+                "min_echo_ratio": self._min_echo_ratio,
             }
         arr = np.array(corrs)
         lags = self._suppressed_lags
@@ -104,12 +123,17 @@ class AEC:
             "total_chunks": self._total_chunks,
             "echo_chunks": self._echo_chunks,
             "echo_pct": round(100 * self._echo_chunks / self._total_chunks, 1),
+            "emr_blocked_chunks": self._emr_blocked_chunks,
+            "emr_blocked_pct": round(
+                100 * self._emr_blocked_chunks / self._total_chunks, 1
+            ),
             "correlation_min": round(float(np.min(arr)), 4),
             "correlation_max": round(float(np.max(arr)), 4),
             "correlation_mean": round(float(np.mean(arr)), 4),
             "correlation_p50": round(float(np.median(arr)), 4),
             "correlation_p95": round(float(np.percentile(arr, 95)), 4),
             "threshold": self._correlation_threshold,
+            "min_echo_ratio": self._min_echo_ratio,
             **lag_stats,
         }
 
@@ -196,10 +220,14 @@ class AEC:
         if peak_corr < self._correlation_threshold:
             return mic
 
-        # Echo detected — apply spectral suppression
+        # Echo candidate detected — but verify the reference at the
+        # detected lag actually dominates the mic signal before
+        # suppressing. Without this gate, the bot's recent vocabulary
+        # (e.g. "Coke", "Sprite") in the reference buffer correlates
+        # spuriously with the user repeating those words, and we end up
+        # cancelling legitimate user speech. See voiceclean v0.3.4
+        # release notes.
         peak_lag = np.argmax(xcorr_norm)
-        self._echo_chunks += 1
-        self._suppressed_lags.append(int(peak_lag))
 
         # Extract the reference segment at the detected lag
         ref_at_lag = np.zeros_like(mic)
@@ -211,6 +239,18 @@ class AEC:
         if ref_lag_energy < 1e-6:
             return mic
 
+        # EMR gate: real echo overpowers (or rivals) the mic signal.
+        # Incidental vocabulary overlap doesn't — the user's voice is
+        # then the dominant energy. Skip suppression in that case.
+        emr = ref_lag_energy / (mic_energy + 1e-10)
+        if emr < self._min_echo_ratio:
+            self._emr_blocked_chunks += 1
+            return mic
+
+        # Past both gates — count as suppressed echo.
+        self._echo_chunks += 1
+        self._suppressed_lags.append(int(peak_lag))
+
         # Spectral masking: suppress frequency bins where echo dominates
         n_fft = len(mic)
         mic_spec = np.fft.rfft(mic, n_fft)
@@ -219,19 +259,27 @@ class AEC:
         mic_mag = np.abs(mic_spec)
         ref_mag = np.abs(ref_spec)
 
-        # Gain mask: reduce bins where reference (echo) is strong
-        # relative to the mic signal
+        # Per-bin echo ratio. Only act on bins where the reference is
+        # at least as loud as the mic — i.e. the bot's energy genuinely
+        # dominates that frequency bin. The previous threshold of 0.3
+        # damaged bins where the mic was up to 3x louder than the ref,
+        # stripping consonants the user actually produced.
         echo_ratio = ref_mag / (mic_mag + 1e-10)
 
         # Scale by correlation strength — higher correlation = more
-        # confident echo detection = more aggressive suppression
+        # confident echo detection = more aggressive suppression.
         suppression_strength = min(peak_corr / self._correlation_threshold, 3.0)
 
+        # Soft suppression curve: gain falls smoothly from 1.0 as the
+        # reference dominance grows past 1.0, floored by suppress_gain.
+        # This replaces the previous linear `1 - strength * ratio` which
+        # cliff-jumps and over-suppresses when echo_ratio is near the gate.
         gain = np.ones_like(mic_mag)
-        echo_bins = echo_ratio > 0.3
+        echo_bins = echo_ratio > 1.0
+        excess = echo_ratio[echo_bins] - 1.0
         gain[echo_bins] = np.maximum(
             self._suppress_gain,
-            1.0 - suppression_strength * echo_ratio[echo_bins],
+            1.0 / (1.0 + suppression_strength * excess),
         )
 
         result_spec = mic_spec * gain

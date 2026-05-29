@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voiceclean"
-version = "0.3.3"
+version = "0.3.6"
 description = "Real-time acoustic echo cancellation (AEC) and voice activity detection (VAD) for voice agents. Pure Python + numpy — no external C libraries."
 readme = "README.md"
 license = "MIT"

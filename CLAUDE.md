@@ -8,6 +8,59 @@
 
 ---
 
+# Honest production status (read this before recommending voiceclean)
+
+Extended testing on real Hindi/English calls (Twilio + Exotel, Sarvam + Azure + Deepgram STT) on 2026-05-28 / 29 surfaced two reproducible failure modes that the README's "tested in production" phrasing did not previously reflect. **Both are documented in detail below.** If a downstream user reports STT garbling or fragmented turns with voiceclean enabled, the cause is almost certainly one of these two; don't blame their STT provider until you have ruled them out.
+
+## Failure mode 1 — AEC damages user speech when caller repeats bot vocabulary
+
+Reproducible across multiple callees, multiple handsets, multiple acoustic environments. Same callee, same downstream Azure STT, same `+919454777614` test handset:
+
+- **Call CAa8b0aff7… (voiceclean, hi-IN, Azure)** — Sarvam batch on the recording reads the caller channel as "इस हफ्ते मुझे आप कोक डेढ़ लीटर का दस केस…" (clean). The live Azure STT, which received the *post-voiceclean* audio in real time, transcribed it as "इस हफ्ते मुझे आप को डेढ़ लीटर का 10 केस… इस फ्लाइट डेढ़ लीटर… घंटा ऑरेंज…". Coke → "आप को" (eaten), Sprite → "फ्लाइट", Fanta → "घंटा".
+- **Call CA8c4a6b2d… (voiceclean, hi-IN, Azure, 2026-05-29 02:32 UTC)** — same handset. Live Azure heard "फ्लाइट दे दीजिए। रिटर्न 10 के और पांटा ऑरेंज के लिए टेड लीटर का बीच केस" — Sprite → "फ्लाइट", "डेढ़ लीटर 10 केस" → "रिटर्न 10 के", Fanta → "पांटा", "डेढ़ लीटर" → "टेड लीटर", "बीस केस" → "बीच केस".
+- **Same handset two minutes later on AIC (CAe2f1b4…)** — live Azure heard "कोक/स्प्राइट/फैंटा/डेढ़ लीटर" cleanly. Only mishearing was Coke → "कोख", which is well within Azure STT's normal Hindi error rate.
+
+The signature is consistent. Hard consonants and brand names get warped; common Hindi words are unaffected.
+
+**Why it happens.** Cross-correlation between the user's mic chunk and the 800 ms reference buffer crosses the suppression threshold whenever the user repeats a word the bot has recently spoken — because the user's audio shares spectral content with the reference, not because there is acoustic echo. The spectral mask then suppresses bins where the reference dominates, stripping the very formants that distinguish "Coke" from "ok" or "Sprite" from "Flight".
+
+**What has been tried.** v0.3.4 added two gates (EMR ≥ 0.5, per-bin `echo_ratio > 1.0`) and a softer suppression curve. These reduce but do not eliminate the damage. The fundamental issue is that 8 kHz telephony bandwidth does not carry enough spectral information to distinguish bot-bleed echo from user repeating bot vocabulary; cross-correlation alone is not a sufficient discriminator.
+
+**What we don't know.** Whether a stricter EMR (e.g., 4.0), a lag-window restriction (only consider lags 30–300 ms), or a switch to coherence-based detection would close it. We did not have time to validate any of these in production.
+
+## Failure mode 2 — VAD fragments streaming STT (partial fix in v0.3.6)
+
+`VoiceCleanVAD` shipped with `stop_secs=0.0` to minimise barge-in latency. Pipecat's Sarvam and Deepgram STT services finalise their current utterance on every `VADUserStoppedSpeakingFrame`, which at `stop_secs=0.0` fires at every gap between words. The streaming STT then commits one fragment per word.
+
+Concrete evidence — call 457a6a8b…, en-US, Sarvam streaming STT, voiceclean filter, dumped IN/OUT PCM at the actual live sample rate:
+
+- **Sarvam batch STT on the OUT.pcm file** → "I want Coke 1.5 liter 10 cases, Fanta orange 1.5 liter 20 cases and Sprite 1.5 liter 30 cases." (clean)
+- **Sarvam streaming STT on the same audio during the live call** → 15 fragments: "Phone | I want to cook | 1.5 | Hello | 10 cases | Fine | Orange | 1.5 liter | Sweetheart | Yes | Okay | Condition | Spright | 1.5 | 5 liter | Okay, Sir"
+
+The audio bytes were fine. The chunking destroyed them. VAD simulation at multiple `stop_secs` values on real dumped recordings:
+
+| Call | live frags | @0.0 | @0.05 | @0.2 | @0.5 |
+|---|---:|---:|---:|---:|---:|
+| #2  vc/hi-IN/Sarvam | 14 | 21 | 15 | 7 | 4 |
+| #10 vc/en-US/Deepgram/Exotel | 22 | 35 | 18 | 12 | 7 |
+| #16 vc/hi-IN/Deepgram | 15 | 24 | 19 | 15 | 9 |
+| #1  vc/hi-IN/Azure (Azure ignores VAD!) | 3 | 23 | 21 | 9 | 6 |
+
+v0.3.6 changes the default to 0.2 (matches Pipecat's own VAD default). Simulation says fragmentation drops 1.5–3× but is not eliminated — order conversations with 3 SKU+qty pairs still produce 7–15 fragments where ideal is 3.
+
+**Azure STT is the only escape.** Pipecat's `AzureSTTService` ignores `VADUserStoppedSpeakingFrame` entirely and uses its own internal endpointing. Confirmed by reading `pipecat/services/azure/stt.py` — it runs `start_continuous_recognition_async()` and only reacts to its own `recognized` callback. That is why voiceclean + Azure produced clean transcripts even on calls where the VAD fired 23 stop events.
+
+## Recommendation to anyone integrating voiceclean today
+
+- Do not deploy voiceclean as the production audio filter for a voice agent that uses **Sarvam or Deepgram streaming STT**. Use AIC or another filter with carrier-side AEC and a more conservative VAD wrapper.
+- If your downstream STT is **Azure streaming**, the VAD problem does not affect you, but the AEC speech-damage problem (failure mode 1) can still hurt orders that involve repeating brand names.
+- For batch / offline STT use cases, voiceclean works as advertised — the failures above are specific to the streaming-STT integration path.
+- If you adopt anyway, set `stop_secs ≥ 0.2` when creating the VAD analyser, and log the per-call `get_stats()` output so the AEC's behaviour is visible in your call records.
+
+This section is intentionally pessimistic about our own package. If a future version genuinely closes the gap, edit it down — but only after a controlled real-call A/B test, not synthetic verification.
+
+---
+
 # What this project is
 
 An open-source Python package providing real-time **acoustic echo cancellation (AEC)** and **voice activity detection (VAD)** for voice AI agents. Published on [PyPI](https://pypi.org/project/voiceclean/) as `voiceclean`, documented at [voiceclean.readthedocs.io](https://voiceclean.readthedocs.io), source at [github.com/sortstring/voiceclean](https://github.com/sortstring/voiceclean). MIT licensed.
@@ -90,8 +143,9 @@ Read `docs/how-aec-works.md` or `voiceclean/aec.py` for the full algorithm.
 | `sample_rate` | 8000 | Audio sample rate in Hz |
 | `chunk_ms` | 40 | Analysis chunk size (ms). Larger = more reliable, more latency |
 | `buffer_ms` | 800 | Reference ring buffer length (ms). Must cover max echo delay. Increase for international calls. |
-| `correlation_threshold` | 0.15 | Cross-correlation above which echo is detected. Lower = catches weaker echo but more false positives. **0.10 recommended for telephony** — production data showed borderline echo at p95 0.13–0.15 slipping through on ~14% of Exotel calls. Normal speech correlates at 0.01–0.08. |
-| `suppress_db` | -30.0 | Echo suppression depth (dB). -30 = echo at ~3% of original. |
+| `correlation_threshold` | 0.15 | Cross-correlation above which echo is *considered*. Unchanged from v0.3.3 — real echo on telephony often sits at 0.13–0.20, so raising it would lose echo catches. In v0.3.4 the user-speech-damage failure mode is handled by `min_echo_ratio` instead. |
+| `min_echo_ratio` | 0.5 | NEW in v0.3.4. Reference-at-lag energy / mic energy below which a chunk is not considered echo even if correlation crosses threshold. Real echo dominates the mic signal; incidental vocabulary correlation doesn't. Set to 0.0 to restore pre-v0.3.4 detection behaviour. |
+| `suppress_db` | -30.0 | Echo suppression depth (dB) floor. -30 = echo bin at ~3% of original. Used as the floor on the per-bin soft-suppression gain. |
 
 ## VAD (`voiceclean/vad.py`)
 
@@ -99,6 +153,43 @@ Read `docs/how-aec-works.md` or `voiceclean/aec.py` for the full algorithm.
 |-----------|---------|-----------------|
 | `sample_rate` | 8000 | Must be 8000 or 16000 (Silero limitation) |
 | `threshold` | 0.5 | Speech probability above which `is_speech=True` |
+
+## VAD analyzer (`voiceclean/pipecat/vad.py`, the Pipecat-side wrapper)
+
+| Parameter | Default | What it controls |
+|-----------|---------|-----------------|
+| `confidence` | 0.5 | Silero confidence above which a frame counts as speech. |
+| `start_secs` | 0.0 | How long confidence must stay above threshold before "speech started" fires. 0 = fire instantly. |
+| `stop_secs` | 0.2 | How long confidence must stay below threshold before "speech stopped" fires. **Raised from 0.0 to 0.2 in v0.3.6** — at 0.0 the VAD signalled "stopped" at every inter-word pause, fragmenting streaming-STT utterances into one-word chunks and producing noise transcription. Pipecat's own default is 0.2; ai-coustics uses 0.05. Keep above ~0.15 unless you have a specific reason to sacrifice STT quality for ~200 ms of turn-end latency. |
+| `min_volume` | 0.0 | Minimum audio volume to count as speech. Disabled by default (Silero confidence is a strong signal on its own). |
+
+`VoiceCleanFilter.create_vad_analyzer()` now accepts `confidence`, `start_secs`, `stop_secs`, and `min_volume` directly, and aliases `speech_hold_duration` (an ai-coustics-side kwarg the agent passes in some integrations) onto `stop_secs` when no explicit value is given. The `sensitivity` kwarg is accepted for ai-coustics drop-in compatibility and ignored.
+
+---
+
+# Debug dump (v0.3.5+)
+
+`VoiceCleanFilter` honours the env var `VOICECLEAN_DEBUG_DUMP_DIR`. If set to a writable directory, every filter instance writes three raw PCM streams per call:
+
+- `vc_<ts>_<pid>_<id>_in.pcm`  — mic audio BEFORE the AEC
+- `vc_<ts>_<pid>_<id>_out.pcm` — mic audio AFTER the AEC (this is what reaches STT)
+- `vc_<ts>_<pid>_<id>_ref.pcm` — bot audio fed as the AEC reference
+
+Format: signed 16-bit little-endian, mono, at the filter's configured sample rate (default 8000 Hz). Convert with:
+
+```bash
+ffmpeg -f s16le -ar 8000 -ac 1 -i vc_<...>_out.pcm vc_<...>_out.wav
+```
+
+Purpose: distinguish "voiceclean damaged the audio" from "downstream STT mis-recognised clean audio". A pre/post diff at the live sample rate is the only reliable way — Twilio dual-channel MP3 recordings round-trip through 8 kHz µ-law → PCM → 22 kHz MP3 and don't show artefacts that may matter to streaming STT.
+
+No agent-app code change is needed to enable it. Set the env var before starting the agent:
+
+```bash
+VOICECLEAN_DEBUG_DUMP_DIR=/tmp/vcdump python -m agent.server
+```
+
+I/O failures are best-effort: a full disk warns once and silently drops further writes; the live call never aborts because of dump failure.
 
 ---
 
@@ -176,6 +267,27 @@ Attempted to distinguish bot speech from human speech using Mel-frequency cepstr
 Included in v0.1.0 for background noise removal. Operates at 48 kHz internally. The double resampling (8k→48k→8k) degraded narrowband telephony audio, producing garbled STT transcriptions. Disabled for telephony. The code remains in `denoise.py` but is not used.
 
 **Do not re-enable RNNoise for 8 kHz audio.**
+
+## VAD with zero stop-hold (v0.3.0–v0.3.5)
+
+The `VoiceCleanVAD` defaults were `start_secs=0.0 / stop_secs=0.0` — both set deliberately to minimise barge-in latency. In practice this caused the dominant call-quality problem we saw in production: streaming STT (both Sarvam Saaras and Azure) was receiving the user's speech fragmented into one-word utterances, because the VAD emitted "speech stopped" at every inter-word pause.
+
+The give-away was a comparison of in-process behaviour vs offline replay: dumping the post-filter PCM to a file and running it through batch STT produced the correct transcript ("I want Coke 1.5 liter 10 cases, …"), while live streaming STT on the same audio produced fragments ("I want to cook | 1.5 | Hello | 10 cases | Sweetheart | …"). Same bytes, different VAD chunking.
+
+v0.3.6 raises the default `stop_secs` to 0.2 (matching Pipecat's own default), keeps `start_secs=0.0` so barge-in still happens promptly, and exposes the full `VADParams` (`confidence`, `start_secs`, `stop_secs`, `min_volume`) through `create_vad_analyzer()` so a caller can tune them per integration. The agent's `aic_filter.create_vad_analyzer(speech_hold_duration=0.05, ...)` pattern is now honoured by voiceclean too — `speech_hold_duration` aliases `stop_secs` when no explicit value is given.
+
+**Do not set `stop_secs=0` again without verifying that the downstream streaming STT can still produce coherent transcriptions on multi-word user turns.** The latency you save is dwarfed by the recognition damage.
+
+## Single-gate cross-correlation detection (v0.3.0–v0.3.3)
+
+Pre-v0.3.4 the AEC's only check was `peak_corr > correlation_threshold` (default 0.15), after which every frequency bin where `ref_mag > 0.3 * mic_mag` got suppressed by up to -30 dB. This had two real-call failure modes that were reproduced across multiple callers, handsets, and acoustic environments on outbound Coca-Cola Nepal calls (Twilio + Exotel, Hindi + English):
+
+- **Over-suppression.** When the bot had just listed product names (e.g. "Coke, Sprite, Fanta"), the reference buffer carried those phonemes. When the user immediately repeated them ("I want Coke 1.5 litre 10 cases"), cross-correlation crossed 0.15 from phonetic similarity alone — no actual echo. The mask then stripped the very consonants the user produced: "Coke → cook", "Sprite → Flight/Super Right/It's quite", "Fanta → penta/Punjab", "30 cases → certificates".
+- **Under-suppression.** On the same calls, real handset-earpiece bleed of the bot's greeting was sometimes not caught — voiceclean transcribed the bot's own words as caller speech ("Hello, I'm an AI assistant calling from Co...").
+
+v0.3.4 adds a second gate (Echo-to-Mic energy Ratio, EMR) between detection and suppression, tightens the per-bin selection from `> 0.3` to `> 1.0`, and switches the suppression curve from cliff-jumping linear to soft (`1 / (1 + s * (ratio - 1))`). The default `correlation_threshold` stays at 0.15 — real-echo correlations sit close to it and raising it loses real catches; the EMR gate is what stops the false-positive case. The stats dict now also reports `emr_blocked_chunks` so you can see how often the EMR gate is vetoing the correlation gate in production.
+
+**Do not re-introduce single-gate detection without a per-call replay test against shared-vocabulary conversation, not just background-noise echo.**
 
 ---
 

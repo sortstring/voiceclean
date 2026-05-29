@@ -21,7 +21,36 @@ Some telephony providers (like Twilio) perform echo cancellation on their infras
 
 Commercial solutions like ai-coustics ($149/mo) provide noise suppression and VAD but not echo cancellation. voiceclean provides AEC + VAD as a single open-source package — free, no API keys, no network calls.
 
-**Tested in production** on both Twilio and Exotel with real PSTN calls in Hindi, English, and Nepali. Handles noisy environments (multiple people talking in the background) where commercial alternatives fail.
+## Status — read this before adopting
+
+After extended production testing on real Hindi/English/Nepali sales calls (Twilio + Exotel, multiple callees, multiple acoustic environments), we have to be honest about two failure modes that we did not catch in our earlier testing. Both reproduce reliably; one is a config bug we believe is fixed in v0.3.6, the other is a deeper algorithmic limit we have not solved.
+
+**1. AEC spectrally damages legitimate user speech when the caller repeats vocabulary the bot just spoke.**
+On telephony PSTN audio with shared vocabulary (the bot just listed product names, the retailer repeats them to order), cross-correlation between the user's mic chunk and the reference buffer crosses the suppression threshold not because there is acoustic echo, but because the two share phonemes. The spectral mask then strips the very formants the user just produced. Observed substitutions across many calls, same callee, same downstream STT:
+
+| User said | Downstream STT heard (voiceclean) | Downstream STT heard (no voiceclean) |
+|---|---|---|
+| "Coke" | "cook" / "कोप देख" / "कोख" / dropped | "Coke" |
+| "Sprite" | "Flight" / "Super Right" / "Spright" / "फ्लाइट" / "स्प्राइस" | "Sprite" |
+| "Fanta" | "penta" / "Punjab" / "पांटा" / "घंटा" | "Fanta" |
+| "1.5 litre" | "टेड लीटर" / "डिजिटल कॉक" / "डिलीटर" | "1.5 litre" |
+| "30 cases" | "certificates" / "per tea cases" | "30 cases" |
+
+We attempted a fix in v0.3.4 (Echo-to-Mic ratio gate + softer per-bin mask). It reduces but does not eliminate the damage. The fundamental issue is that the cross-correlation framing cannot distinguish "real echo" from "user repeating bot vocabulary" at 8 kHz telephony bandwidth.
+
+**2. The shipped VAD default (`stop_secs=0.0`) fragments streaming STT on every inter-word pause.**
+Pipecat's Sarvam STT and Deepgram STT services call `flush()` / `Finalize` on every `VADUserStoppedSpeakingFrame`. With voiceclean's pre-v0.3.6 VAD wrapper at `stop_secs=0.0`, that frame fires at every gap between words, and the streaming STT commits a fragment per word. A clean "I want Coke 1.5 litre 10 cases, Sprite 1.5 litre 20 cases" arrives at the LLM as 15–22 garbled mini-utterances. Azure STT is the only one of the three that escapes because it ignores Pipecat VAD events and uses its own endpointing. v0.3.6 changes the default to 0.2 (matching Pipecat's own default) but the underlying state machine is still sensitive — pause-heavy speakers still fragment.
+
+**What we recommend right now:**
+
+- If your downstream STT is **Sarvam or Deepgram (streaming)**, voiceclean is not yet ready for your production traffic. Use ai-coustics (or another filter with carrier AEC) until these issues are resolved.
+- If your downstream STT is **Azure (streaming)**, the VAD fragmentation issue does not affect you, but the AEC speech-damage issue can still hurt high-overlap conversations.
+- If you are doing **research / batch transcription / experimentation**, voiceclean works as advertised in this README and the article.
+- If you adopt anyway, set `stop_secs ≥ 0.2` when creating the VAD analyzer, and instrument the per-call stats in your DB so you can see what voiceclean is doing.
+
+The full investigation is in `ARTICLE_DRAFT.md` (post-mortem section). The dev-facing notes are in `CLAUDE.md`.
+
+**Tested in production** on both Twilio and Exotel with real PSTN calls in Hindi, English, and Nepali — but the verdict from that testing is the section above, not the cheerful claim we used to make here.
 
 ## Install
 
